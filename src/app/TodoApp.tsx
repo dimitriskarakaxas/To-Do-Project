@@ -1,121 +1,144 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  startTransition,
+  useMemo,
+  useOptimistic,
+  useRef,
+  useState,
+} from "react";
+import {
+  addTodo,
+  clearCompleted,
+  deleteTodo,
+  toggleTodo,
+  updateTodoText,
+} from "./actions";
+import type { TodoRow } from "@/lib/supabase";
 
 type Todo = {
   id: string;
   text: string;
   completed: boolean;
-  createdAt: number;
+  created_at: string;
 };
 
 type Filter = "all" | "active" | "completed";
 
-const STORAGE_KEY = "todo-app:todos";
+type OptimisticAction =
+  | { type: "add"; todo: Todo }
+  | { type: "toggle"; id: string; completed: boolean }
+  | { type: "updateText"; id: string; text: string }
+  | { type: "delete"; id: string }
+  | { type: "clearCompleted" };
 
-function loadTodos(): Todo[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (t): t is Todo =>
-        t &&
-        typeof t.id === "string" &&
-        typeof t.text === "string" &&
-        typeof t.completed === "boolean" &&
-        typeof t.createdAt === "number",
-    );
-  } catch {
-    return [];
+function reduce(state: Todo[], action: OptimisticAction): Todo[] {
+  switch (action.type) {
+    case "add":
+      return [action.todo, ...state];
+    case "toggle":
+      return state.map((t) =>
+        t.id === action.id ? { ...t, completed: action.completed } : t,
+      );
+    case "updateText":
+      return state.map((t) =>
+        t.id === action.id ? { ...t, text: action.text } : t,
+      );
+    case "delete":
+      return state.filter((t) => t.id !== action.id);
+    case "clearCompleted":
+      return state.filter((t) => !t.completed);
   }
 }
 
-export default function TodoApp() {
-  const [todos, setTodos] = useState<Todo[]>([]);
-  const [hydrated, setHydrated] = useState(false);
+export default function TodoApp({ initialTodos }: { initialTodos: TodoRow[] }) {
+  const [optimisticTodos, applyOptimistic] = useOptimistic<
+    Todo[],
+    OptimisticAction
+  >(initialTodos, reduce);
+
   const [draft, setDraft] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
   const editInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    setTodos(loadTodos());
-    setHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(todos));
-  }, [todos, hydrated]);
-
-  useEffect(() => {
-    if (editingId && editInputRef.current) {
-      editInputRef.current.focus();
-      editInputRef.current.select();
-    }
-  }, [editingId]);
-
   const visible = useMemo(() => {
-    if (filter === "active") return todos.filter((t) => !t.completed);
-    if (filter === "completed") return todos.filter((t) => t.completed);
-    return todos;
-  }, [todos, filter]);
+    if (filter === "active") return optimisticTodos.filter((t) => !t.completed);
+    if (filter === "completed")
+      return optimisticTodos.filter((t) => t.completed);
+    return optimisticTodos;
+  }, [optimisticTodos, filter]);
 
-  const remaining = todos.filter((t) => !t.completed).length;
-  const hasCompleted = todos.some((t) => t.completed);
+  const remaining = optimisticTodos.filter((t) => !t.completed).length;
+  const hasCompleted = optimisticTodos.some((t) => t.completed);
 
-  function addTodo() {
+  function handleAdd() {
     const text = draft.trim();
     if (!text) return;
-    const newTodo: Todo = {
-      id: crypto.randomUUID(),
-      text,
-      completed: false,
-      createdAt: Date.now(),
-    };
-    setTodos((prev) => [newTodo, ...prev]);
     setDraft("");
+    startTransition(async () => {
+      applyOptimistic({
+        type: "add",
+        todo: {
+          id: `optimistic-${crypto.randomUUID()}`,
+          text,
+          completed: false,
+          created_at: new Date().toISOString(),
+        },
+      });
+      await addTodo(text);
+    });
   }
 
-  function toggleTodo(id: string) {
-    setTodos((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, completed: !t.completed } : t)),
-    );
+  function handleToggle(id: string, completed: boolean) {
+    startTransition(async () => {
+      applyOptimistic({ type: "toggle", id, completed });
+      await toggleTodo(id, completed);
+    });
   }
 
-  function deleteTodo(id: string) {
-    setTodos((prev) => prev.filter((t) => t.id !== id));
+  function handleDelete(id: string) {
     if (editingId === id) setEditingId(null);
+    startTransition(async () => {
+      applyOptimistic({ type: "delete", id });
+      await deleteTodo(id);
+    });
   }
 
   function startEditing(todo: Todo) {
     setEditingId(todo.id);
     setEditingText(todo.text);
+    requestAnimationFrame(() => {
+      editInputRef.current?.focus();
+      editInputRef.current?.select();
+    });
   }
 
   function commitEdit() {
     if (!editingId) return;
+    const id = editingId;
     const text = editingText.trim();
-    if (!text) {
-      deleteTodo(editingId);
-    } else {
-      setTodos((prev) =>
-        prev.map((t) => (t.id === editingId ? { ...t, text } : t)),
-      );
-    }
     setEditingId(null);
+    if (!text) {
+      handleDelete(id);
+      return;
+    }
+    startTransition(async () => {
+      applyOptimistic({ type: "updateText", id, text });
+      await updateTodoText(id, text);
+    });
   }
 
   function cancelEdit() {
     setEditingId(null);
   }
 
-  function clearCompleted() {
-    setTodos((prev) => prev.filter((t) => !t.completed));
+  function handleClearCompleted() {
+    startTransition(async () => {
+      applyOptimistic({ type: "clearCompleted" });
+      await clearCompleted();
+    });
   }
 
   return (
@@ -131,7 +154,7 @@ export default function TodoApp() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            addTodo();
+            handleAdd();
           }}
           className="flex items-center gap-2 border-b border-neutral-200 p-4 dark:border-neutral-800"
         >
@@ -153,13 +176,9 @@ export default function TodoApp() {
         </form>
 
         <ul className="divide-y divide-neutral-200 dark:divide-neutral-800">
-          {!hydrated ? (
+          {visible.length === 0 ? (
             <li className="px-4 py-10 text-center text-sm text-neutral-500">
-              Loading…
-            </li>
-          ) : visible.length === 0 ? (
-            <li className="px-4 py-10 text-center text-sm text-neutral-500">
-              {todos.length === 0
+              {optimisticTodos.length === 0
                 ? "Nothing here yet. Add your first task above."
                 : `No ${filter} tasks.`}
             </li>
@@ -172,7 +191,7 @@ export default function TodoApp() {
                 <input
                   type="checkbox"
                   checked={todo.completed}
-                  onChange={() => toggleTodo(todo.id)}
+                  onChange={() => handleToggle(todo.id, !todo.completed)}
                   aria-label={`Mark "${todo.text}" as ${
                     todo.completed ? "active" : "completed"
                   }`}
@@ -207,7 +226,7 @@ export default function TodoApp() {
                 )}
                 <button
                   type="button"
-                  onClick={() => deleteTodo(todo.id)}
+                  onClick={() => handleDelete(todo.id)}
                   aria-label={`Delete "${todo.text}"`}
                   className="shrink-0 rounded-md p-1 text-neutral-400 opacity-0 transition hover:bg-neutral-100 hover:text-red-600 group-hover:opacity-100 focus:opacity-100 dark:hover:bg-neutral-800"
                 >
@@ -230,7 +249,7 @@ export default function TodoApp() {
           )}
         </ul>
 
-        {hydrated && todos.length > 0 && (
+        {optimisticTodos.length > 0 && (
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-200 px-4 py-3 text-xs text-neutral-600 dark:border-neutral-800 dark:text-neutral-400">
             <span>
               {remaining} {remaining === 1 ? "task" : "tasks"} left
@@ -258,7 +277,7 @@ export default function TodoApp() {
             </div>
             <button
               type="button"
-              onClick={clearCompleted}
+              onClick={handleClearCompleted}
               disabled={!hasCompleted}
               className="rounded-md px-2 py-1 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-neutral-800"
             >
